@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+
 import "../chainlink-evm/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import "../chainlink-evm/contracts/src/v0.8/vrf/dev/interfaces/IVRFMigratableConsumerV2Plus.sol";
 import "../chainlink-evm/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
@@ -8,9 +9,13 @@ import "../chainlink-evm/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.so
 /**
  * @title Fortuna VRF Lottery
  * @notice A decentralized lottery contract using Chainlink VRF v2.5 for randomness.
- * Players enter by paying a ticket price; after each round, a winner is picked and rewarded.
+ * @dev ASSESSMENT ONLY: This contract was modified for a technical hiring task.
+ * Not for production deployment.
+ * 1. Isolated jackpot reserve from prize pool using activePrizePool accounting.
+ * 2. Added requestId validation in fulfillRandomWords to ensure callback integrity.
  */
-contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
+
+ contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
     enum LotteryState { Open, Calculating }
 
     /// @notice List of players who entered the current round.
@@ -24,6 +29,9 @@ contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
 
     /// @notice Jackpot reserve accumulated from previous rounds.
     uint256 public jackpotReserve;
+
+    /// @notice Internal accounting for the current round's ticket revenue.
+    uint256 public activePrizePool;
 
     /// @notice Most recent winner.
     address public recentWinner;
@@ -54,6 +62,9 @@ contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
 
     /// @notice Last VRF request ID.
     uint256 public lastRequestId;
+
+    /// @notice Mapping to track active VRF requests for validation.
+    mapping(uint256 => bool) public pendingRequests;
 
     /// @notice Current state of the lottery (open or calculating).
     LotteryState public lotteryState;
@@ -98,6 +109,7 @@ contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
         require(msg.value == ticketPrice, "Incorrect ticket price");
         require(block.timestamp < roundEndTime, "Round ended");
 
+        activePrizePool += msg.value;
         players.push(msg.sender);
         emit PlayerEntered(msg.sender);
     }
@@ -135,28 +147,34 @@ contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
         });
 
         lastRequestId = COORDINATOR.requestRandomWords(req);
+        pendingRequests[lastRequestId] = true;
     }
 
     /**
     * @notice Callback function used by VRF Coordinator to provide random words.
     */
-    function fulfillRandomWords(uint256 /*requestId*/, uint256[] calldata randomWords) internal override {
+    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
+        require(pendingRequests[requestId], "Invalid Request");
         require(players.length > 0, "No players in this round");
+        
+        delete pendingRequests[requestId];
 
         uint256 winnerIndex = randomWords[0] % players.length;
         recentWinner = players[winnerIndex];
 
-        uint256 prize = (address(this).balance * 80) / 100;
-        uint256 toJackpot = address(this).balance - prize;
+        uint256 currentRoundFunds = activePrizePool;
+        uint256 prize = (currentRoundFunds * 80) / 100;
+        uint256 toJackpot = currentRoundFunds - prize;
 
         jackpotReserve += toJackpot;
+        activePrizePool = 0;
 
         if (prize > 0) {
-            payable(recentWinner).transfer(prize);
+            (bool success, ) = payable(recentWinner).call{value: prize}("");
+            require(success, "Transfer failed");
         }
 
         emit WinnerPicked(recentWinner, prize);
-
         _startNewRound();
     }
 
@@ -179,7 +197,9 @@ contract FortunaVRFLottery is VRFConsumerBaseV2Plus {
         require(jackpotReserve > 0, "No jackpot");
         uint256 amount = jackpotReserve;
         jackpotReserve = 0;
-        to.transfer(amount);
+        
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "Withdrawal failed");
     }
 
     /**
